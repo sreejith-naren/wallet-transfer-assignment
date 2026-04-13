@@ -31,6 +31,13 @@ type TransferResponse struct {
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
+// IdempotencyData stores both response and error information for replay
+type IdempotencyData struct {
+	Response     *TransferResponse `json:"response,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	ErrorMessage string            `json:"errorMessage,omitempty"`
+}
+
 // TransferService handles transfer business logic
 type TransferService struct {
 	repo repository.Repository
@@ -42,7 +49,8 @@ func NewTransferService(repo repository.Repository) *TransferService {
 
 // CreateTransfer handles the complete transfer workflow with idempotency
 func (s *TransferService) CreateTransfer(ctx context.Context, req TransferRequest) (*TransferResponse, error) {
-	// Step 1: Check for existing idempotency record
+	// Step 1: Fast-path check for existing idempotency record (outside transaction)
+	// This is an optimization to avoid transaction overhead for duplicate requests
 	existingRecord, err := s.repo.GetIdempotencyRecord(ctx, req.IdempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check idempotency: %w", err)
@@ -50,14 +58,18 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req TransferReques
 
 	if existingRecord != nil {
 		log.Printf("Idempotency key %s found, returning cached response", req.IdempotencyKey)
-		var response TransferResponse
-		if err := json.Unmarshal(existingRecord.ResponseData, &response); err != nil {
+		var data IdempotencyData
+		if err := json.Unmarshal(existingRecord.ResponseData, &data); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal cached response: %w", err)
 		}
-		return &response, nil
+		// If original request resulted in error, return same error
+		if data.Error != "" {
+			return data.Response, mapErrorFromString(data.Error)
+		}
+		return data.Response, nil
 	}
 
-	// Step 2: Execute transfer in transaction
+	// Step 2: Execute transfer in transaction with race-safe idempotency check
 	response, err := s.executeTransfer(ctx, req)
 	if err != nil {
 		return nil, err
@@ -74,20 +86,40 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Ensure rollback is attempted but guard against panics coming from
-	// test mocks that return an uninitialized *gorm.DB. We don't want a
-	// panic in a defer to abort the test run; recover and ignore such
-	// panics when rolling back.
-	// Ensure rollback is attempted via repository so tests can mock it.
+	// Track whether transaction has been finalized (committed or rolled back)
+	var txFinalized bool
 	defer func() {
-		if tx == nil {
-			return
+		if !txFinalized && tx != nil {
+			// Transaction was neither committed nor explicitly rolled back, clean up
+			_ = s.repo.RollbackTx(ctx, tx)
 		}
-		// Let repository handle the rollback; ignore rollback errors here.
-		_ = s.repo.RollbackTx(ctx, tx)
 	}()
 
-	// Create transfer domain object
+	// Race-safe idempotency check inside transaction
+	// Check again for idempotency record to handle concurrent requests
+	existingRecord, err := s.repo.GetIdempotencyRecord(ctx, req.IdempotencyKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check idempotency in transaction: %w", err)
+	}
+
+	if existingRecord != nil {
+		log.Printf("Idempotency key %s found during transaction, returning cached response", req.IdempotencyKey)
+		// Explicitly rollback - no changes needed
+		if err := s.repo.RollbackTx(ctx, tx); err != nil {
+			log.Printf("Warning: failed to rollback transaction: %v", err)
+		}
+		txFinalized = true
+
+		var data IdempotencyData
+		if err := json.Unmarshal(existingRecord.ResponseData, &data); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal cached response: %w", err)
+		}
+		// If original request resulted in error, return same error
+		if data.Error != "" {
+			return data.Response, mapErrorFromString(data.Error)
+		}
+		return data.Response, nil
+	} // Create transfer domain object
 	transfer, err := domain.NewTransfer(req.FromWalletID, req.ToWalletID, req.Amount)
 	if err != nil {
 		return nil, err
@@ -103,8 +135,34 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 	wallets, err := s.repo.GetWalletsForUpdate(ctx, tx, walletIDs)
 	if err != nil {
 		// Mark transfer as failed if wallets not found
-		_ = s.repo.UpdateTransferState(ctx, tx, transfer.ID, domain.TransferStateFailed)
-		_ = s.repo.CommitTx(ctx, tx)
+		if updateErr := s.repo.UpdateTransferState(ctx, tx, transfer.ID, domain.TransferStateFailed); updateErr != nil {
+			// If we can't mark as failed, rollback and return original error
+			return nil, err
+		}
+
+		// Build failed response
+		failedResponse := &TransferResponse{
+			TransferID:   transfer.ID.String(),
+			State:        string(domain.TransferStateFailed),
+			FromWalletID: transfer.FromWalletID,
+			ToWalletID:   transfer.ToWalletID,
+			Amount:       transfer.Amount,
+			CreatedAt:    transfer.CreatedAt,
+		}
+
+		// Store idempotency record for failed transfer
+		// This is critical - if we can't store idempotency, we must rollback
+		if idempErr := s.storeIdempotencyRecordWithError(ctx, tx, req.IdempotencyKey, transfer.ID, failedResponse, err); idempErr != nil {
+			// Failed to store idempotency, rollback everything
+			log.Printf("Failed to store idempotency record for failed transfer: %v", idempErr)
+			return nil, fmt.Errorf("failed to store idempotency record: %w", idempErr)
+		}
+
+		// Commit the failed transfer state with idempotency record
+		if commitErr := s.repo.CommitTx(ctx, tx); commitErr != nil {
+			return nil, fmt.Errorf("failed to commit failed transfer: %w", commitErr)
+		}
+		txFinalized = true
 		return nil, err
 	}
 
@@ -141,14 +199,15 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 		}
 
 		// Store idempotency record for failed transfer
-		if err := s.storeIdempotencyRecord(ctx, tx, req.IdempotencyKey, transfer.ID, response); err != nil {
-			return nil, err
+		if err := s.storeIdempotencyRecordWithError(ctx, tx, req.IdempotencyKey, transfer.ID, response, domain.ErrInsufficientFunds); err != nil {
+			return nil, fmt.Errorf("failed to store idempotency record for failed transfer: %w", err)
 		}
 
 		// Commit transaction
 		if err := s.repo.CommitTx(ctx, tx); err != nil {
 			return nil, err
 		}
+		txFinalized = true
 
 		return nil, domain.ErrInsufficientFunds
 	}
@@ -203,15 +262,19 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 		CreatedAt:    transfer.CreatedAt,
 	}
 
-	// Store idempotency record
+	// Store idempotency record before commit
+	// The unique constraint on idempotency_key will prevent duplicate processing
 	if err := s.storeIdempotencyRecord(ctx, tx, req.IdempotencyKey, transfer.ID, response); err != nil {
-		return nil, err
+		// If this fails due to unique constraint violation, it means a concurrent
+		// request already created the idempotency record, so we should return an error
+		return nil, fmt.Errorf("failed to store idempotency record: %w", err)
 	}
 
 	// Commit transaction
 	if err := s.repo.CommitTx(ctx, tx); err != nil {
 		return nil, err
 	}
+	txFinalized = true
 
 	log.Printf("Transfer %s completed successfully: %s -> %s, amount: %d",
 		transfer.ID.String(), req.FromWalletID.String(), req.ToWalletID.String(), req.Amount)
@@ -219,9 +282,13 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 	return response, nil
 }
 
-// storeIdempotencyRecord stores the idempotency record
+// storeIdempotencyRecord stores the idempotency record for successful transfers
 func (s *TransferService) storeIdempotencyRecord(ctx context.Context, tx *gorm.DB, key uuid.UUID, transferID uuid.UUID, response *TransferResponse) error {
-	responseData, err := json.Marshal(response)
+	data := IdempotencyData{
+		Response: response,
+	}
+
+	responseData, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal response: %w", err)
 	}
@@ -238,6 +305,77 @@ func (s *TransferService) storeIdempotencyRecord(ctx context.Context, tx *gorm.D
 	}
 
 	return nil
+}
+
+// storeIdempotencyRecordWithError stores the idempotency record for failed transfers
+func (s *TransferService) storeIdempotencyRecordWithError(ctx context.Context, tx *gorm.DB, key uuid.UUID, transferID uuid.UUID, response *TransferResponse, domainErr error) error {
+	data := IdempotencyData{
+		Response:     response,
+		Error:        errorToString(domainErr),
+		ErrorMessage: domainErr.Error(),
+	}
+
+	responseData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal response: %w", err)
+	}
+
+	record := &domain.IdempotencyRecord{
+		IdempotencyKey: key,
+		TransferID:     transferID,
+		ResponseData:   responseData,
+		CreatedAt:      time.Now(),
+	}
+
+	if err := s.repo.CreateIdempotencyRecord(ctx, tx, record); err != nil {
+		return fmt.Errorf("failed to store idempotency record: %w", err)
+	}
+
+	return nil
+}
+
+// errorToString converts domain errors to string identifiers
+func errorToString(err error) string {
+	switch err {
+	case domain.ErrInsufficientFunds:
+		return "INSUFFICIENT_FUNDS"
+	case domain.ErrWalletNotFound:
+		return "WALLET_NOT_FOUND"
+	case domain.ErrInvalidAmount:
+		return "INVALID_AMOUNT"
+	case domain.ErrSameWallet:
+		return "SAME_WALLET"
+	case domain.ErrTransferNotFound:
+		return "TRANSFER_NOT_FOUND"
+	case domain.ErrInvalidState:
+		return "INVALID_STATE"
+	case domain.ErrInvalidStateTransition:
+		return "INVALID_STATE_TRANSITION"
+	default:
+		return "INTERNAL_ERROR"
+	}
+}
+
+// mapErrorFromString converts string identifiers back to domain errors
+func mapErrorFromString(errStr string) error {
+	switch errStr {
+	case "INSUFFICIENT_FUNDS":
+		return domain.ErrInsufficientFunds
+	case "WALLET_NOT_FOUND":
+		return domain.ErrWalletNotFound
+	case "INVALID_AMOUNT":
+		return domain.ErrInvalidAmount
+	case "SAME_WALLET":
+		return domain.ErrSameWallet
+	case "TRANSFER_NOT_FOUND":
+		return domain.ErrTransferNotFound
+	case "INVALID_STATE":
+		return domain.ErrInvalidState
+	case "INVALID_STATE_TRANSITION":
+		return domain.ErrInvalidStateTransition
+	default:
+		return fmt.Errorf("internal error")
+	}
 }
 
 // GetTransfer retrieves a transfer by ID
