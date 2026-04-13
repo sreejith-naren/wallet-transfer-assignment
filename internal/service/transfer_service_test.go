@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 	"wallet-transfer/internal/domain"
@@ -198,7 +199,7 @@ func TestTransferService_CreateTransfer_Success(t *testing.T) {
 
 	// Mock: transaction commit/rollback via repository
 	mockRepo.On("CommitTx", ctx, &mockTx.DB).Return(nil)
-	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil)
+	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil).Maybe()
 
 	// Execute
 	response, err := service.CreateTransfer(ctx, req)
@@ -254,7 +255,7 @@ func TestTransferService_CreateTransfer_InsufficientFunds(t *testing.T) {
 
 	// Mock: transaction commit/rollback via repository
 	mockRepo.On("CommitTx", ctx, &mockTx.DB).Return(nil)
-	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil)
+	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil).Maybe()
 
 	// Execute
 	response, err := service.CreateTransfer(ctx, req)
@@ -293,7 +294,10 @@ func TestTransferService_CreateTransfer_Idempotency(t *testing.T) {
 		Amount:       100,
 		CreatedAt:    time.Now(),
 	}
-	responseData, _ := json.Marshal(cachedResponse)
+	idempData := IdempotencyData{
+		Response: cachedResponse,
+	}
+	responseData, _ := json.Marshal(idempData)
 
 	// Mock: existing idempotency record found
 	existingRecord := &domain.IdempotencyRecord{
@@ -315,6 +319,120 @@ func TestTransferService_CreateTransfer_Idempotency(t *testing.T) {
 
 	mockRepo.AssertExpectations(t)
 	// Verify that BeginTx was NOT called (transfer not executed)
+	mockRepo.AssertNotCalled(t, "BeginTx")
+}
+
+func TestTransferService_CreateTransfer_Idempotency_FailedTransfer(t *testing.T) {
+	mockRepo := new(MockRepository)
+	service := NewTransferService(mockRepo)
+
+	ctx := context.Background()
+	fromWalletID := uuid.New()
+	toWalletID := uuid.New()
+	idempotencyKey := uuid.New()
+	transferID := uuid.New()
+
+	req := TransferRequest{
+		IdempotencyKey: idempotencyKey,
+		FromWalletID:   fromWalletID,
+		ToWalletID:     toWalletID,
+		Amount:         100,
+	}
+
+	// Create cached response for a FAILED transfer
+	failedResponse := &TransferResponse{
+		TransferID:   transferID.String(),
+		State:        string(domain.TransferStateFailed),
+		FromWalletID: fromWalletID,
+		ToWalletID:   toWalletID,
+		Amount:       100,
+		CreatedAt:    time.Now(),
+	}
+	idempData := IdempotencyData{
+		Response:     failedResponse,
+		Error:        "INSUFFICIENT_FUNDS",
+		ErrorMessage: "insufficient funds",
+	}
+	responseData, _ := json.Marshal(idempData)
+
+	// Mock: existing idempotency record found with error state
+	existingRecord := &domain.IdempotencyRecord{
+		IdempotencyKey: idempotencyKey,
+		TransferID:     transferID,
+		ResponseData:   responseData,
+		CreatedAt:      time.Now(),
+	}
+	mockRepo.On("GetIdempotencyRecord", ctx, idempotencyKey).Return(existingRecord, nil)
+
+	// Execute
+	response, err := service.CreateTransfer(ctx, req)
+
+	// Assert - should return the same error as original failed transfer
+	assert.Error(t, err)
+	assert.Equal(t, domain.ErrInsufficientFunds, err)
+	assert.NotNil(t, response)
+	assert.Equal(t, transferID.String(), response.TransferID)
+	assert.Equal(t, string(domain.TransferStateFailed), response.State)
+
+	mockRepo.AssertExpectations(t)
+	// Verify that BeginTx was NOT called (transfer not re-executed)
+	mockRepo.AssertNotCalled(t, "BeginTx")
+}
+
+func TestTransferService_CreateTransfer_Idempotency_WalletNotFoundError(t *testing.T) {
+	mockRepo := new(MockRepository)
+	service := NewTransferService(mockRepo)
+
+	ctx := context.Background()
+	fromWalletID := uuid.New()
+	toWalletID := uuid.New()
+	idempotencyKey := uuid.New()
+	transferID := uuid.New()
+
+	req := TransferRequest{
+		IdempotencyKey: idempotencyKey,
+		FromWalletID:   fromWalletID,
+		ToWalletID:     toWalletID,
+		Amount:         50,
+	}
+
+	// Create cached response for a FAILED transfer with WalletNotFound error
+	failedResponse := &TransferResponse{
+		TransferID:   transferID.String(),
+		State:        string(domain.TransferStateFailed),
+		FromWalletID: fromWalletID,
+		ToWalletID:   toWalletID,
+		Amount:       50,
+		CreatedAt:    time.Now(),
+	}
+	idempData := IdempotencyData{
+		Response:     failedResponse,
+		Error:        "WALLET_NOT_FOUND",
+		ErrorMessage: "wallet not found",
+	}
+	responseData, _ := json.Marshal(idempData)
+
+	// Mock: existing idempotency record found with wallet not found error
+	existingRecord := &domain.IdempotencyRecord{
+		IdempotencyKey: idempotencyKey,
+		TransferID:     transferID,
+		ResponseData:   responseData,
+		CreatedAt:      time.Now(),
+	}
+	mockRepo.On("GetIdempotencyRecord", ctx, idempotencyKey).Return(existingRecord, nil)
+
+	// Execute
+	response, err := service.CreateTransfer(ctx, req)
+
+	// Assert - should return the same error type as original failed transfer
+	assert.Error(t, err)
+	assert.Equal(t, domain.ErrWalletNotFound, err)
+	assert.NotNil(t, response)
+	assert.Equal(t, transferID.String(), response.TransferID)
+	assert.Equal(t, string(domain.TransferStateFailed), response.State)
+
+	mockRepo.AssertExpectations(t)
+	// Verify that BeginTx was NOT called
 	mockRepo.AssertNotCalled(t, "BeginTx")
 }
 
@@ -351,9 +469,12 @@ func TestTransferService_CreateTransfer_WalletNotFound(t *testing.T) {
 	// Mock: update transfer state to failed
 	mockRepo.On("UpdateTransferState", ctx, &mockTx.DB, mock.AnythingOfType("uuid.UUID"), domain.TransferStateFailed).Return(nil)
 
+	// Mock: create idempotency record for failed transfer
+	mockRepo.On("CreateIdempotencyRecord", ctx, &mockTx.DB, mock.AnythingOfType("*domain.IdempotencyRecord")).Return(nil)
+
 	// Mock: transaction commit/rollback via repository
 	mockRepo.On("CommitTx", ctx, &mockTx.DB).Return(nil)
-	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil)
+	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil).Maybe()
 
 	// Execute
 	response, err := service.CreateTransfer(ctx, req)
@@ -422,7 +543,7 @@ func TestTransferService_CreateTransfer_LedgerEntries(t *testing.T) {
 
 	// Mock: transaction commit/rollback via repository
 	mockRepo.On("CommitTx", ctx, &mockTx.DB).Return(nil)
-	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil)
+	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil).Maybe()
 
 	// Execute
 	response, err := service.CreateTransfer(ctx, req)
@@ -507,6 +628,181 @@ func TestTransferService_GetTransfer(t *testing.T) {
 	assert.Equal(t, fromWalletID, response.FromWalletID)
 	assert.Equal(t, toWalletID, response.ToWalletID)
 	assert.Equal(t, int64(100), response.Amount)
+
+	mockRepo.AssertExpectations(t)
+}
+
+func TestConcurrentSameIdempotencyKeyRace_SimulatedWithMocks(t *testing.T) {
+	mockRepo := new(MockRepository)
+	service := NewTransferService(mockRepo)
+
+	ctx := context.Background()
+	fromWalletID := uuid.New()
+	toWalletID := uuid.New()
+	idempotencyKey := uuid.New()
+
+	req := TransferRequest{
+		IdempotencyKey: idempotencyKey,
+		FromWalletID:   fromWalletID,
+		ToWalletID:     toWalletID,
+		Amount:         100,
+	}
+
+	allowSecondStart := make(chan struct{})
+	idempotencyStored := make(chan struct{})
+
+	cachedRecord := &domain.IdempotencyRecord{}
+
+	mockRepo.On("GetIdempotencyRecord", ctx, idempotencyKey).Return(nil, nil).Once()
+	mockRepo.On("GetIdempotencyRecord", ctx, idempotencyKey).
+		Return(nil, nil).
+		Once().
+		Run(func(args mock.Arguments) {
+			close(allowSecondStart)
+		})
+	mockRepo.On("GetIdempotencyRecord", ctx, idempotencyKey).
+		Return(cachedRecord, nil).
+		Once().
+		Run(func(args mock.Arguments) {
+			<-idempotencyStored
+		})
+
+	mockTx := &MockTx{}
+	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil).Once()
+	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil).Once()
+
+	fromWallet := &domain.Wallet{ID: fromWalletID, Balance: 1000}
+	toWallet := &domain.Wallet{ID: toWalletID, Balance: 100}
+	mockRepo.On("GetWalletsForUpdate", ctx, &mockTx.DB, mock.AnythingOfType("[]uuid.UUID")).
+		Return([]*domain.Wallet{fromWallet, toWallet}, nil).
+		Once()
+
+	mockRepo.On("UpdateWalletBalance", ctx, &mockTx.DB, fromWalletID, int64(900)).Return(nil).Once()
+	mockRepo.On("UpdateWalletBalance", ctx, &mockTx.DB, toWalletID, int64(200)).Return(nil).Once()
+
+	mockRepo.On("CreateLedgerEntry", ctx, &mockTx.DB, mock.AnythingOfType("*domain.LedgerEntry")).Return(nil).Twice()
+	mockRepo.On("UpdateTransferState", ctx, &mockTx.DB, mock.AnythingOfType("uuid.UUID"), domain.TransferStateProcessed).Return(nil).Once()
+	mockRepo.On("CreateIdempotencyRecord", ctx, &mockTx.DB, mock.AnythingOfType("*domain.IdempotencyRecord")).
+		Return(nil).
+		Once().
+		Run(func(args mock.Arguments) {
+			record := args.Get(2).(*domain.IdempotencyRecord)
+			*cachedRecord = *record
+			close(idempotencyStored)
+		})
+
+	mockRepo.On("CommitTx", ctx, &mockTx.DB).Return(nil).Once()
+	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil).Maybe()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var resp1, resp2 *TransferResponse
+	var err1, err2 error
+
+	go func() {
+		defer wg.Done()
+		resp1, err1 = service.CreateTransfer(ctx, req)
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-allowSecondStart
+		resp2, err2 = service.CreateTransfer(ctx, req)
+	}()
+
+	wg.Wait()
+
+	assert.NoError(t, err1)
+	assert.NoError(t, err2)
+	assert.NotNil(t, resp1)
+	assert.NotNil(t, resp2)
+	assert.Equal(t, resp1.TransferID, resp2.TransferID)
+
+	mockRepo.AssertExpectations(t)
+	mockRepo.AssertNumberOfCalls(t, "BeginTx", 1)
+	mockRepo.AssertNumberOfCalls(t, "CreateTransfer", 1)
+}
+
+func TestConcurrentSameWalletDebits_SimulatedWithMocks(t *testing.T) {
+	mockRepo := new(MockRepository)
+	service := NewTransferService(mockRepo)
+
+	ctx := context.Background()
+	fromWalletID := uuid.New()
+	toWalletID1 := uuid.New()
+	toWalletID2 := uuid.New()
+
+	req1 := TransferRequest{
+		IdempotencyKey: uuid.New(),
+		FromWalletID:   fromWalletID,
+		ToWalletID:     toWalletID1,
+		Amount:         80,
+	}
+
+	req2 := TransferRequest{
+		IdempotencyKey: uuid.New(),
+		FromWalletID:   fromWalletID,
+		ToWalletID:     toWalletID2,
+		Amount:         80,
+	}
+
+	startSecond := make(chan struct{})
+
+	mockRepo.On("GetIdempotencyRecord", ctx, mock.AnythingOfType("uuid.UUID")).Return(nil, nil).Times(4)
+
+	mockTx := &MockTx{}
+	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil).Twice()
+	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil).Twice()
+
+	fromWalletFirst := &domain.Wallet{ID: fromWalletID, Balance: 100}
+	toWalletFirst := &domain.Wallet{ID: toWalletID1, Balance: 0}
+	mockRepo.On("GetWalletsForUpdate", ctx, &mockTx.DB, mock.AnythingOfType("[]uuid.UUID")).
+		Return([]*domain.Wallet{fromWalletFirst, toWalletFirst}, nil).
+		Once().
+		Run(func(args mock.Arguments) {
+			close(startSecond)
+		})
+
+	fromWalletSecond := &domain.Wallet{ID: fromWalletID, Balance: 20}
+	toWalletSecond := &domain.Wallet{ID: toWalletID2, Balance: 0}
+	mockRepo.On("GetWalletsForUpdate", ctx, &mockTx.DB, mock.AnythingOfType("[]uuid.UUID")).
+		Return([]*domain.Wallet{fromWalletSecond, toWalletSecond}, nil).
+		Once()
+
+	mockRepo.On("UpdateWalletBalance", ctx, &mockTx.DB, fromWalletID, int64(20)).Return(nil).Once()
+	mockRepo.On("UpdateWalletBalance", ctx, &mockTx.DB, toWalletID1, int64(80)).Return(nil).Once()
+
+	mockRepo.On("CreateLedgerEntry", ctx, &mockTx.DB, mock.AnythingOfType("*domain.LedgerEntry")).Return(nil).Twice()
+	mockRepo.On("UpdateTransferState", ctx, &mockTx.DB, mock.AnythingOfType("uuid.UUID"), domain.TransferStateProcessed).Return(nil).Once()
+
+	mockRepo.On("UpdateTransferState", ctx, &mockTx.DB, mock.AnythingOfType("uuid.UUID"), domain.TransferStateFailed).Return(nil).Once()
+	mockRepo.On("CreateIdempotencyRecord", ctx, &mockTx.DB, mock.AnythingOfType("*domain.IdempotencyRecord")).Return(nil).Twice()
+
+	mockRepo.On("CommitTx", ctx, &mockTx.DB).Return(nil).Twice()
+	mockRepo.On("RollbackTx", ctx, &mockTx.DB).Return(nil).Maybe()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var err1, err2 error
+
+	go func() {
+		defer wg.Done()
+		_, err1 = service.CreateTransfer(ctx, req1)
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-startSecond
+		_, err2 = service.CreateTransfer(ctx, req2)
+	}()
+
+	wg.Wait()
+
+	assert.NoError(t, err1)
+	assert.Error(t, err2)
+	assert.Equal(t, domain.ErrInsufficientFunds, err2)
 
 	mockRepo.AssertExpectations(t)
 }
