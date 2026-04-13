@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     amount BIGINT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT valid_entry_type CHECK (entry_type IN ('DEBIT', 'CREDIT')),
-    CONSTRAINT positive_entry_amount CHECK (amount > 0)
+    CONSTRAINT positive_entry_amount CHECK (amount > 0),
+    CONSTRAINT unique_transfer_entry_type UNIQUE (transfer_id, entry_type)
 );
 
 -- Create idempotency_records table
@@ -43,9 +44,6 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
 
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_transfers_state ON transfers(state);
-CREATE INDEX IF NOT EXISTS idx_ledger_wallet ON ledger_entries(wallet_id);
-CREATE INDEX IF NOT EXISTS idx_ledger_transfer ON ledger_entries(transfer_id);
-CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_records(created_at);
 
 -- Insert test wallets for development (using UUIDs)
 INSERT INTO wallets (id, balance) VALUES 
