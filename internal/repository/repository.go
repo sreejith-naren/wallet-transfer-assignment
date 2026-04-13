@@ -31,6 +31,7 @@ type Repository interface {
 	CreateLedgerEntry(ctx context.Context, tx *gorm.DB, entry *domain.LedgerEntry) error
 
 	// Idempotency operations
+	AcquireIdempotencyLock(ctx context.Context, tx *gorm.DB, key uuid.UUID) error
 	GetIdempotencyRecord(ctx context.Context, key uuid.UUID) (*domain.IdempotencyRecord, error)
 	CreateIdempotencyRecord(ctx context.Context, tx *gorm.DB, record *domain.IdempotencyRecord) error
 }
@@ -173,6 +174,17 @@ func (r *PostgresRepository) CreateLedgerEntry(ctx context.Context, tx *gorm.DB,
 	if err := tx.WithContext(ctx).Create(entry).Error; err != nil {
 		return fmt.Errorf("failed to create ledger entry: %w", err)
 	}
+	return nil
+}
+
+// AcquireIdempotencyLock acquires an exclusive advisory lock on the idempotency key
+// This blocks concurrent requests with the same key until the transaction commits/rolls back
+func (r *PostgresRepository) AcquireIdempotencyLock(ctx context.Context, tx *gorm.DB, key uuid.UUID) error {
+	// Use PostgreSQL's hashtext function to convert UUID string to int64 for advisory lock
+	if err := tx.WithContext(ctx).Exec("SELECT pg_advisory_xact_lock(hashtext(?))", key.String()).Error; err != nil {
+		return fmt.Errorf("failed to acquire advisory lock: %w", err)
+	}
+
 	return nil
 }
 

@@ -74,6 +74,11 @@ func (m *MockRepository) CreateLedgerEntry(ctx context.Context, tx *gorm.DB, ent
 	return args.Error(0)
 }
 
+func (m *MockRepository) AcquireIdempotencyLock(ctx context.Context, tx *gorm.DB, key uuid.UUID) error {
+	args := m.Called(ctx, tx, key)
+	return args.Error(0)
+}
+
 func (m *MockRepository) GetIdempotencyRecord(ctx context.Context, key uuid.UUID) (*domain.IdempotencyRecord, error) {
 	args := m.Called(ctx, key)
 	if args.Get(0) == nil {
@@ -175,6 +180,9 @@ func TestTransferService_CreateTransfer_Success(t *testing.T) {
 	mockTx := &MockTx{}
 	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil)
 
+	// Mock: acquire idempotency lock
+	mockRepo.On("AcquireIdempotencyLock", ctx, &mockTx.DB, idempotencyKey).Return(nil)
+
 	// Mock: create transfer
 	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil)
 
@@ -237,6 +245,9 @@ func TestTransferService_CreateTransfer_InsufficientFunds(t *testing.T) {
 	// Mock: begin transaction
 	mockTx := &MockTx{}
 	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil)
+
+	// Mock: acquire idempotency lock
+	mockRepo.On("AcquireIdempotencyLock", ctx, &mockTx.DB, idempotencyKey).Return(nil)
 
 	// Mock: create transfer
 	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil)
@@ -459,6 +470,9 @@ func TestTransferService_CreateTransfer_WalletNotFound(t *testing.T) {
 	mockTx := &MockTx{}
 	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil)
 
+	// Mock: acquire idempotency lock
+	mockRepo.On("AcquireIdempotencyLock", ctx, &mockTx.DB, idempotencyKey).Return(nil)
+
 	// Mock: create transfer
 	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil)
 
@@ -509,6 +523,9 @@ func TestTransferService_CreateTransfer_LedgerEntries(t *testing.T) {
 	// Mock: begin transaction
 	mockTx := &MockTx{}
 	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil)
+
+	// Mock: acquire idempotency lock
+	mockRepo.On("AcquireIdempotencyLock", ctx, &mockTx.DB, idempotencyKey).Return(nil)
 
 	// Mock: create transfer
 	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil)
@@ -669,6 +686,10 @@ func TestConcurrentSameIdempotencyKeyRace_SimulatedWithMocks(t *testing.T) {
 
 	mockTx := &MockTx{}
 	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil).Once()
+
+	// Mock: acquire idempotency lock
+	mockRepo.On("AcquireIdempotencyLock", ctx, &mockTx.DB, idempotencyKey).Return(nil).Once()
+
 	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil).Once()
 
 	fromWallet := &domain.Wallet{ID: fromWalletID, Balance: 1000}
@@ -753,6 +774,10 @@ func TestConcurrentSameWalletDebits_SimulatedWithMocks(t *testing.T) {
 
 	mockTx := &MockTx{}
 	mockRepo.On("BeginTx", ctx).Return(&mockTx.DB, nil).Twice()
+
+	// Mock: acquire idempotency lock
+	mockRepo.On("AcquireIdempotencyLock", ctx, &mockTx.DB, mock.AnythingOfType("uuid.UUID")).Return(nil).Twice()
+
 	mockRepo.On("CreateTransfer", ctx, &mockTx.DB, mock.AnythingOfType("*domain.Transfer")).Return(nil).Twice()
 
 	fromWalletFirst := &domain.Wallet{ID: fromWalletID, Balance: 100}

@@ -95,8 +95,13 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 		}
 	}()
 
+	// Acquire exclusive lock on idempotency key to prevent concurrent duplicate requests
+	// This blocks until any other transaction with the same key commits/rolls back
+	if err := s.repo.AcquireIdempotencyLock(ctx, tx, req.IdempotencyKey); err != nil {
+		return nil, fmt.Errorf("failed to acquire idempotency lock: %w", err)
+	}
+
 	// Race-safe idempotency check inside transaction
-	// Check again for idempotency record to handle concurrent requests
 	existingRecord, err := s.repo.GetIdempotencyRecord(ctx, req.IdempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check idempotency in transaction: %w", err)
@@ -119,7 +124,9 @@ func (s *TransferService) executeTransfer(ctx context.Context, req TransferReque
 			return data.Response, mapErrorFromString(data.Error)
 		}
 		return data.Response, nil
-	} // Create transfer domain object
+	}
+
+	// Create transfer domain object
 	transfer, err := domain.NewTransfer(req.FromWalletID, req.ToWalletID, req.Amount)
 	if err != nil {
 		return nil, err
