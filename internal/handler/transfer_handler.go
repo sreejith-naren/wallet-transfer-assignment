@@ -92,7 +92,7 @@ func (h *TransferHandler) handleError(c *gin.Context, err error) {
 
 	switch err {
 	case domain.ErrInsufficientFunds:
-		c.JSON(http.StatusConflict, ErrorResponse{
+		c.JSON(http.StatusUnprocessableEntity, ErrorResponse{
 			Error:   "INSUFFICIENT_FUNDS",
 			Message: "Insufficient funds in source wallet",
 		})
